@@ -8,9 +8,61 @@ on:
       - Dockerfile
       - requirements.txt
 
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/nautilus-trader-base
+
 jobs:
   build:
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            platform: linux/amd64
+          - runner: ubuntu-24.04-arm
+            platform: linux/arm64
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ matrix.platform }}
+          cache-to: type=gha,scope=${{ matrix.platform }},mode=max
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          DIGEST="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${DIGEST#sha256:}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ strategy.job-index }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
     runs-on: ubuntu-latest
+    needs: build
     permissions:
       contents: read
       packages: write
@@ -24,8 +76,6 @@ jobs:
           VERSION=$(grep -oP 'nautilus-trader==\K[0-9.]+' requirements.txt)
           echo "tag=$VERSION" >> "$GITHUB_OUTPUT"
 
-      - uses: docker/setup-qemu-action@v3
-
       - uses: docker/setup-buildx-action@v3
 
       - uses: docker/login-action@v3
@@ -34,14 +84,14 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: docker/build-push-action@v6
+      - uses: actions/download-artifact@v4
         with:
-          context: .
-          file: Dockerfile
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: |
-            ghcr.io/${{ github.repository_owner }}/nautilus-trader-base:latest
-            ghcr.io/${{ github.repository_owner }}/nautilus-trader-base:${{ steps.version.outputs.tag }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          path: /tmp/digests
+          pattern: digest-*
+          merge-multiple: true
+
+      - name: Create multi-arch manifest
+        run: |
+          TAGS="-t ${{ env.IMAGE }}:latest -t ${{ env.IMAGE }}:${{ steps.version.outputs.tag }}"
+          SOURCES=$(printf '${{ env.IMAGE }}@sha256:%s ' $(ls /tmp/digests/))
+          docker buildx imagetools create $TAGS $SOURCES
